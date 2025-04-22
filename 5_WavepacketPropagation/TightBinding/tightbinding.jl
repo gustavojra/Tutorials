@@ -5,6 +5,8 @@ import Base: length
 struct Grid{T <: Real}
     xvals::Vector{T}
     kvals::Vector{T}
+    dx::T
+    dk::T
 end
 
 length(G::Grid) = length(G.xvals)
@@ -14,7 +16,7 @@ function Grid(dx, N)
     xvals = dx .* collect(0:N-1)
     dk = 2π / L
     kvals = collect(-N÷2:N÷2 - 1) .* dk
-    return Grid(xvals, kvals)
+    return Grid(xvals, kvals, dx, dk)
 end
 
 abstract type StateVector end
@@ -141,4 +143,103 @@ end
 
 function variance_wavevector(sv::RealSpaceVector)
     return variance_wavevector(ReciprocalSpaceVector(sv))
+end
+
+
+############# Hamiltonian
+
+abstract type Hamiltonian end
+
+struct RealSpaceHamiltonian{T <: Complex, R <: Real} <: Hamiltonian
+    matrix::Matrix{T}
+    grid::Grid{R}
+end
+
+struct ReciprocalSpaceHamiltonian{T <: Complex, R <: Real} <: Hamiltonian
+    matrix::Matrix{T}
+    grid::Grid{R}
+end
+
+function tightbinding_realspace(grid::Grid, t::Real)
+    N = length(grid)
+    H = zeros(ComplexF64, N, N)
+
+    # mod1 handles periodic boundary conditions
+    for i in 1:N
+        H[i, mod1(i+1, N)] = -t
+        H[i, mod1(i-1, N)] = -t
+    end
+
+    return RealSpaceHamiltonian(H, grid)
+end
+
+function tightbinding_kspace(grid::Grid, t::Real)
+    N = length(grid)
+    H = zeros(ComplexF64, N, N)
+    for i in 1:N
+        k = grid.kvals[i]
+        H[i,i] = -2t * cos(k * grid.dx)
+    end
+
+    return ReciprocalSpaceHamiltonian(H, grid)
+end
+
+function time_evolve(H::RealSpaceHamiltonian, ψ0::RealSpaceVector, t::Real)
+    @assert H.grid === ψ0.grid "Grid mismatch in real space time evolution"
+    U = exp(-im * H.matrix * t)
+    amps_t = U * ψ0.amps
+    return RealSpaceVector(amps_t, ψ0.grid)
+end
+
+function time_evolve(H::ReciprocalSpaceHamiltonian, ψ0::ReciprocalSpaceVector, t::Real)
+    @assert H.grid === ψ0.grid "Grid mismatch in k-space time evolution"
+    U = exp(-im * H.matrix * t)
+    amps_t = U * ψ0.amps
+    return ReciprocalSpaceVector(amps_t, ψ0.grid)
+end
+
+function tight_binding_time_evolve(H::ReciprocalSpaceHamiltonian, ψ0::ReciprocalSpaceVector, t::Real)
+    @assert H.grid === ψ0.grid "Grid mismatch in k-space time evolution"
+    U = Diagonal(exp.(-im .* diag(H.matrix) .* t))
+    amps_t = U * ψ0.amps
+    return ReciprocalSpaceVector(amps_t, ψ0.grid)
+end
+
+using Statistics, LinearAlgebra, Plots
+
+function compute_velocity(H::ReciprocalSpaceHamiltonian, ψ0::ReciprocalSpaceVector, tvals::Vector{<:Real})
+    @assert H.grid === ψ0.grid "Grid mismatch"
+
+    x̄s = Float64[]  # store ⟨x(t)⟩
+
+    for t in tvals
+        ψt = tight_binding_time_evolve(H, ψ0, t)
+        ψx = RealSpaceVector(ψt)  # convert to x-space
+        push!(x̄s, average_position(ψx))
+    end
+
+    # Do linear regression: ⟨x⟩ = v * t + x₀
+    coeffs = fit_line(tvals, x̄s)
+    v, x0 = coeffs
+
+    # Group velocity for tight binding model
+    a = H.grid.dx
+    avg_k = average_wavevector(ψ0)
+    gv = 2*a*sin(avg_k * a)
+    # inv_effect_mass = 2*a^2 * cos(avg_k*a)
+
+
+    println("Linear Velocity (linear regression): $v")
+    println("Group Velocity: $gv")
+
+    # Plot ⟨x⟩(t) as scatter + fitted line
+    scatter(tvals, x̄s; label="⟨x⟩(t)", xlabel="Time", ylabel="⟨x⟩", title="Wavepacket Position Over Time")
+    plot!(tvals, x -> v * x + x0; label="Linear fit (v = $(round(v, digits=4)))", lw=2, ls=:dash)
+end
+
+# helper for least-squares line fitting
+function fit_line(x::Vector{<:Real}, y::Vector{<:Real})
+    X = hcat(ones(length(x)), x)
+    β = X \ y  # least squares fit
+    return (β[2], β[1])  # (slope, intercept)
 end
